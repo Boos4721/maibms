@@ -26,6 +26,12 @@ import platform.CoreBluetooth.CBAdvertisementDataLocalNameKey
 import platform.CoreBluetooth.CBCentralManager
 import platform.CoreBluetooth.CBCentralManagerDelegateProtocol
 import platform.CoreBluetooth.CBCharacteristic
+import platform.CoreBluetooth.CBCharacteristicProperties
+import platform.CoreBluetooth.CBCharacteristicPropertyIndicate
+import platform.CoreBluetooth.CBCharacteristicPropertyNotify
+import platform.CoreBluetooth.CBCharacteristicPropertyRead
+import platform.CoreBluetooth.CBCharacteristicPropertyWrite
+import platform.CoreBluetooth.CBCharacteristicPropertyWriteWithoutResponse
 import platform.CoreBluetooth.CBCharacteristicWriteWithoutResponse
 import platform.CoreBluetooth.CBManagerState
 import platform.CoreBluetooth.CBManagerStatePoweredOff
@@ -67,6 +73,16 @@ class IosBleTransport : BmsTransport {
         /** 通道探测：超时 8s、切通道间隔 200ms（与 Android / 官方一致，docs/02 §2.2） */
         const val PROBE_TIMEOUT_MS = 8_000L
         const val PROBE_SETTLE_MS = 200L
+
+        /**
+         * 一轮探测的总预算：**按最坏情况（3 条候选）给**，不能用「此刻的 candidates.size」算——
+         * 服务发现完成的信号在特征发现**之前**就发出了，那一刻候选表还是空的，算出来只有 10s，
+         * 而默认通道没应答、只有备用通道能通的板子跑完 3 条要约 26s，于是永远连不上。
+         */
+        const val PROBE_BUDGET_MS = PROBE_TIMEOUT_MS * 3 + 2_000L
+
+        /** 等 CoreBluetooth 状态就位的上限：CBCentralManager 的 state 是异步送的 */
+        const val STATE_WAIT_MS = 3_000L
 
         /** 单次 GATT 写分片上限：与 Android 同值，避免部分从机静默丢包 */
         const val MAX_CHUNK = 240
@@ -114,10 +130,26 @@ class IosBleTransport : BmsTransport {
         val notify: CBCharacteristic,
     )
 
-    private var candidates: List<Candidate> = emptyList()
-    private var candidateIndex = 0
-    private var probeStarted = false
+    // ---- 连接尝试的共享状态 ----
+    // 下面这些字段被两个线程读写：CoreBluetooth 的 delegate（queue = null → 主队列）与连接循环 /
+    // 探测协程（Dispatchers.Default）。Android 那边回调与循环同属一套线程池、JVM 的内存模型也更宽容，
+    // 同样的写法没出过事；iOS 上必须显式 @Volatile，否则会出现「探测应答看不到」「掉线回调看不到
+    // dropSignal」这类只此一家的错乱。
+
+    @Volatile private var candidates: List<Candidate> = emptyList()
+    @Volatile private var candidateIndex = 0
+    @Volatile private var probeStarted = false
     @Volatile private var probeSignal: CompletableDeferred<Boolean>? = null
+
+    /**
+     * 本次连接的「代次」：每开始一次尝试、每次收尾（[closePeripheral]）都 +1。
+     *
+     * iOS 没有 Android 那种「每次重连都是新的 BluetoothGatt 对象」——CoreBluetooth 对同一台设备
+     * 永远返回**同一个 CBPeripheral 实例**，所以 `p !== peripheral` 这种身份判断在重连之后必然为真。
+     * 一个被放弃的探测协程 8 秒后超时回来时，它手里的 p 就是当前活着的链路：退订通知（应用从此
+     * 收不到任何帧）、翻候选页、改写特征，全都打在活链路上。只有代次比较才认得出「这是上一轮的迟到者」。
+     */
+    @Volatile private var attemptGen = 0
 
     /** 下次连接优先尝试的通道（手动切换或按设备记忆；仅本进程有效） */
     @Volatile private var preferred: BleChannel? = null
@@ -129,25 +161,25 @@ class IosBleTransport : BmsTransport {
     @Volatile private var manualStop = false
     private var loopJob: Job? = null
 
-    private var peripheral: CBPeripheral? = null
-    private var writeChar: CBCharacteristic? = null
-    private var notifyChar: CBCharacteristic? = null
+    @Volatile private var peripheral: CBPeripheral? = null
+    @Volatile private var writeChar: CBCharacteristic? = null
+    @Volatile private var notifyChar: CBCharacteristic? = null
 
     /** 单次写上限（字节），由 maximumWriteValueLengthForType 更新 */
     @Volatile private var maxWriteLen: Int = 20
 
     /** 本次尝试的「就绪」信号：true=服务/订阅就绪，false=就绪前断开 */
-    private var readySignal: CompletableDeferred<Boolean>? = null
+    @Volatile private var readySignal: CompletableDeferred<Boolean>? = null
     /** 服务发现完成信号：让「建链 + 发现服务」与「通道探测」两段超时分开算 */
     @Volatile private var servicesSignal: CompletableDeferred<Unit>? = null
-    /** 已就绪后的断开信号 */
-    private var dropSignal: CompletableDeferred<Unit>? = null
+    /** 已就绪后的断开信号（**必须在可能就绪之前就挂好**，见 connectionLoop） */
+    @Volatile private var dropSignal: CompletableDeferred<Unit>? = null
 
     // ---- 扫描（对外列设备 / 对内找目标）----
-    private var scanHandler: ((ScanDevice) -> Unit)? = null
+    @Volatile private var scanHandler: ((ScanDevice) -> Unit)? = null
     /** 扫描命中的目标：精确匹配优先，兜底取第一个 ANT 设备 */
-    private var pendingPeripheral: CBPeripheral? = null
-    private var fallbackPeripheral: CBPeripheral? = null
+    @Volatile private var pendingPeripheral: CBPeripheral? = null
+    @Volatile private var fallbackPeripheral: CBPeripheral? = null
 
     private fun logI(msg: String) = BmsLog.i("BLE", msg)
     private fun logW(msg: String) = BmsLog.w("BLE", msg)
@@ -163,12 +195,7 @@ class IosBleTransport : BmsTransport {
         override fun centralManagerDidUpdateState(central: CBCentralManager) {
             logI("蓝牙状态：${stateText(central.state)}")
             if (central.state != CBManagerStatePoweredOn) {
-                _connectHint.value = when (central.state) {
-                    CBManagerStateUnauthorized ->
-                        "未获得蓝牙权限，请在系统设置中允许本应用使用蓝牙"
-                    CBManagerStatePoweredOff -> "蓝牙未打开，请在控制中心或设置中打开蓝牙"
-                    else -> "蓝牙不可用（${stateText(central.state)}）"
-                }
+                _connectHint.value = stateHint(central.state)
             }
         }
 
@@ -252,8 +279,10 @@ class IosBleTransport : BmsTransport {
                 return
             }
             val services = peripheral.services.orEmpty().mapNotNull { it as? CBService }
-            logD("服务列表: " + services.joinToString { shortUuid(it.UUID.UUIDString) })
-            val service = services.firstOrNull { it.UUID.UUIDString.equals(SERVICE_FFE0, ignoreCase = true) }
+            // 原始 UUIDString 一并打出来：iOS 对 16 位 UUID 有时给短形态（"FFE0"）、有时给完整 128 位，
+            // 日志里只留归一化后的短码会把这个问题掩盖掉（对照用的原始值就是这行的用途）
+            logD("服务列表: " + services.joinToString { "${shortUuid(it.UUID.UUIDString)}(${it.UUID.UUIDString})" })
+            val service = services.firstOrNull { shortUuid(it.UUID.UUIDString) == SERVICE_FFE0 }
             if (service == null) {
                 logE("设备没有 FFE0 服务（不是已知的保护板/电量计？）")
                 readySignal?.complete(false)
@@ -275,24 +304,34 @@ class IosBleTransport : BmsTransport {
             }
             val chars = didDiscoverCharacteristicsForService.characteristics
                 .orEmpty().mapNotNull { it as? CBCharacteristic }
-            logI("特征列表: " + chars.joinToString { shortUuid(it.UUID.UUIDString) })
+            // 特征全集（含属性与原始 UUID）：回答「这块板到底有没有备用通道」的第一手证据
+            logI("特征列表: " + chars.joinToString {
+                "${shortUuid(it.UUID.UUIDString)}(${it.UUID.UUIDString} ${propText(it.properties)})"
+            })
             maxWriteLen = peripheral
                 .maximumWriteValueLengthForType(CBCharacteristicWriteWithoutResponse)
                 .toInt()
             logD("单次写上限 $maxWriteLen 字节")
-            // 候选通道：先按官方规则判定这块硬件有没有备用通道（存在 FFF5 特征；
-            // Android 侧还校验了"可写"属性，iOS 的属性校验待真机验证），再按实际特征过滤
+            // 候选通道：先按官方规则判定这块硬件有没有备用通道（暴露**可写**的 FFF5），
+            // 再按实际特征与属性过滤（写特征要可写、通知特征要能 notify/indicate）——与 Android 同款规则
             val found: List<Candidate> = if (targetFamily.isMeter) {
-                // 电量计：FFE0 下就一对 写 FFE2 / 通知 FFE1（三家实测都提供这对特征）
-                val wc = chars.firstOrNull { it.UUID.UUIDString.equals(BleChannel.Meter.writeUuid, ignoreCase = true) }
-                val nc = chars.firstOrNull { it.UUID.UUIDString.equals(BleChannel.Meter.notifyUuid, ignoreCase = true) }
-                if (wc != null && nc != null) listOf(Candidate(BleChannel.Meter, wc, nc)) else emptyList()
+                // 电量计：FFE0 下就一对 写 FFE2 / 通知 FFE1（三家实测都提供这对特征）；
+                // 找不到就退到「第一个可写 / 第一个可通知」（与 Android 一致）
+                val wc = chars.firstOrNull { shortId(it) == BleChannel.Meter.writeUuid }
+                    ?: chars.firstOrNull { isWritable(it) }
+                val nc = chars.firstOrNull { shortId(it) == BleChannel.Meter.notifyUuid }
+                    ?: chars.firstOrNull { isNotifiable(it) }
+                if (wc != null && nc != null && isWritable(wc) && isNotifiable(nc)) {
+                    listOf(Candidate(BleChannel.Meter, wc, nc))
+                } else emptyList()
             } else {
-                val hasFff5 = chars.any { it.UUID.UUIDString.equals("FFF5", ignoreCase = true) }
-                bleChannelCandidates(hasFff5).mapNotNull { ch ->
-                    val wc = chars.firstOrNull { it.UUID.UUIDString.equals(ch.writeUuid, ignoreCase = true) }
-                    val nc = chars.firstOrNull { it.UUID.UUIDString.equals(ch.notifyUuid, ignoreCase = true) }
-                    if (wc != null && nc != null) Candidate(ch, wc, nc) else null
+                val hasWritableFff5 = chars.any { shortId(it) == "FFF5" && isWritable(it) }
+                bleChannelCandidates(hasWritableFff5).mapNotNull { ch ->
+                    val wc = chars.firstOrNull { shortId(it) == ch.writeUuid }
+                    val nc = chars.firstOrNull { shortId(it) == ch.notifyUuid }
+                    if (wc != null && nc != null && isWritable(wc) && isNotifiable(nc)) {
+                        Candidate(ch, wc, nc)
+                    } else null
                 }
             }
             _availableChannels.value = found.map { it.channel }.ifEmpty { listOf(BleChannel.Default) }
@@ -318,6 +357,14 @@ class IosBleTransport : BmsTransport {
             error: NSError?,
         ) {
             if (error != null) {
+                val uuid = didUpdateNotificationStateForCharacteristic.UUID.UUIDString
+                // 上一轮的迟到回调也会走这里：iOS 复用同一个 CBPeripheral，若它在这里翻页，
+                // 本轮的候选指针就被带偏了。认不准期望特征时（expected == null）保持原行为
+                val expected = notifyChar?.UUID?.UUIDString
+                if (expected != null && !uuid.equals(expected, ignoreCase = true)) {
+                    logD("订阅失败回调不属于当前候选（${shortUuid(uuid)}），忽略")
+                    return
+                }
                 // 订阅没落地 = 这条通道收不到任何帧：换下一个候选（没有下一个则本轮连接失败）
                 logE("订阅通知失败：${error.localizedDescription}（换下一个候选通道）")
                 candidateIndex++
@@ -368,8 +415,14 @@ class IosBleTransport : BmsTransport {
             // 先订阅通知（docs 硬性顺序）
             p.setNotifyValue(true, forCharacteristic = c.notify)
             // 订阅确认个别固件不回调：超时也按「订阅已发出」进入探测，绝不把连接卡死
+            val gen = attemptGen
             scope.launch {
                 delay(READY_FALLBACK_MS)
+                if (gen != attemptGen) return@launch
+                // 走到这里说明订阅确认确实没回调（回调了的话探测早就开始了）
+                if (!probeStarted && !targetFamily.isMeter) {
+                    logD("订阅确认未回调，按 ${READY_FALLBACK_MS}ms 兜底进入探测")
+                }
                 afterSubscribed(p, c)
             }
         }
@@ -395,10 +448,12 @@ class IosBleTransport : BmsTransport {
             // 迟到的兜底（候选已经翻页）不能再探：否则会拿旧候选的写特征去发帧
             if (candidates.getOrNull(candidateIndex) !== c) return
             probeStarted = true
+            val gen = attemptGen
             val signal = CompletableDeferred<Boolean>()
             probeSignal = signal
             scope.launch {
                 delay(PROBE_SETTLE_MS)   // 等订阅生效，与官方 200ms 切通道间隔一致
+                if (gen != attemptGen) return@launch   // 本轮已被收尾，别碰新链路
                 runCatching {
                     p.writeValue(
                         Frame.readRealtime().toNSData(),
@@ -407,6 +462,13 @@ class IosBleTransport : BmsTransport {
                     )
                 }.onFailure { logW("探测帧写入失败：${it.message}") }
                 val ok = withTimeoutOrNull(PROBE_TIMEOUT_MS) { signal.await() } ?: false
+                // 这 8 秒里链路可能已经换代（掉线重连/被放弃）：iOS 的 p 与当前 peripheral 是**同一个
+                // 对象**，下面的退订和翻页会打在活链路上（退订通知 = 应用从此收不到任何帧），
+                // 所以这里必须按代次认人——这是 Android 那句 `g !== gatt` 在 iOS 的等价物
+                if (gen != attemptGen) {
+                    logD("探测协程已过期（第 $gen 轮），丢弃结果：${c.channel.id}")
+                    return@launch
+                }
                 probeSignal = null
                 if (ok) {
                     _activeChannel.value = c.channel
@@ -448,9 +510,63 @@ class IosBleTransport : BmsTransport {
         else -> "未知状态($state)"
     }
 
+    /** 蓝牙状态 → 给用户看的失败原因（要能照着做，不能只说「不可用」） */
+    private fun stateHint(state: CBManagerState): String = when (state) {
+        CBManagerStatePoweredOff -> "蓝牙未打开，请在控制中心或设置中打开蓝牙"
+        CBManagerStateUnauthorized -> "未获得蓝牙权限，请在系统设置中允许本应用使用蓝牙"
+        CBManagerStateUnsupported -> "本机不支持蓝牙"
+        CBManagerStateResetting -> "蓝牙正在重置，请稍后重试"
+        else -> "蓝牙尚未就绪，请稍后重试"
+    }
+
+    /**
+     * 等 CoreBluetooth 状态就位。
+     *
+     * `CBCentralManager` 刚创建时 `state` 是 `.unknown`，真正的状态由 `centralManagerDidUpdateState`
+     * **异步**送来（Apple 要求先等这个回调再用管理器）。不等就会把「还没就绪」误报成「蓝牙未打开」：
+     * 全新安装的用户没有历史设备 → 启动时不自动重连 → 管理器直到点开扫描弹窗才被创建，
+     * 于是第一次扫描必然报「设备蓝牙未打开或未授权」且扫不到任何设备。
+     */
+    private suspend fun awaitState(timeoutMs: Long = STATE_WAIT_MS): CBManagerState {
+        val c = central
+        var waited = 0L
+        while (c.state == CBManagerStateUnknown && waited < timeoutMs) {
+            delay(50)
+            waited += 50
+        }
+        return c.state
+    }
+
     /** "0000FFE0-0000-1000-8000-00805F9B34FB" → "FFE0"；已经是短形态就原样大写 */
     private fun shortUuid(uuid: String): String =
         if (uuid.length >= 8 && uuid.contains('-')) uuid.substring(4, 8).uppercase() else uuid.uppercase()
+
+    /**
+     * 特征的短 UUID，用来和 [BleChannel] 里的 "FFE1" 这类常量比。
+     * iOS 对 16 位 UUID 可能给短形态、也可能给完整 128 位（同一台设备两种都会出现），
+     * 一律归一后再比，别让设备的报法决定我们认不认得它。
+     */
+    private fun shortId(c: CBCharacteristic): String = shortUuid(c.UUID.UUIDString)
+
+    /** 写特征要可写（与 Android 的 isWritable 对齐）；`.toInt()` 是躲开 NS_OPTIONS 映射成 UInt/ULong 的差异 */
+    private fun isWritable(c: CBCharacteristic): Boolean {
+        val mask = CBCharacteristicPropertyWrite or CBCharacteristicPropertyWriteWithoutResponse
+        return (c.properties and mask).toInt() != 0
+    }
+
+    private fun isNotifiable(c: CBCharacteristic): Boolean {
+        val mask = CBCharacteristicPropertyNotify or CBCharacteristicPropertyIndicate
+        return (c.properties and mask).toInt() != 0
+    }
+
+    /** 特征属性 → 人话（写进日志，用来回答「这块板到底有没有备用通道」） */
+    private fun propText(p: CBCharacteristicProperties): String = buildList {
+        if ((p and CBCharacteristicPropertyRead).toInt() != 0) add("读")
+        if ((p and CBCharacteristicPropertyWrite).toInt() != 0) add("写")
+        if ((p and CBCharacteristicPropertyWriteWithoutResponse).toInt() != 0) add("写无响应")
+        if ((p and CBCharacteristicPropertyNotify).toInt() != 0) add("通知")
+        if ((p and CBCharacteristicPropertyIndicate).toInt() != 0) add("指示")
+    }.joinToString("/").ifEmpty { "无" }
 
     private val central: CBCentralManager by lazy {
         CBCentralManager(delegate = delegate, queue = null)
@@ -460,8 +576,10 @@ class IosBleTransport : BmsTransport {
 
     override suspend fun scan(onFound: (ScanDevice) -> Unit) {
         val c = central
-        if (c.state != CBManagerStatePoweredOn) {
-            throw IllegalStateException("设备蓝牙未打开或未授权")
+        // 先等状态就位（首次创建管理器时 state 还是 unknown，见 awaitState）
+        val state = awaitState()
+        if (state != CBManagerStatePoweredOn) {
+            throw IllegalStateException(stateHint(state))
         }
         runCatching { c.stopScan() }
         scanHandler = onFound
@@ -490,8 +608,11 @@ class IosBleTransport : BmsTransport {
         var attempt = 0
         while (!manualStop && currentCoroutineContext().isActive) {
             attempt++
+            // 代次 +1：上一轮遗留的探测协程 / 订阅兜底就此作废（它们手里的 CBPeripheral 与本轮
+            // 是同一个对象，只比对象身份分不出新旧，见 attemptGen 的注释）
+            attemptGen++
             if (attempt > 1) _connectHint.value = "第 $attempt 次尝试…"
-            logI("连接尝试 #$attempt")
+            logI("连接尝试 #$attempt（代次 $attemptGen）")
             _linkState.value = LinkState.Connecting
 
             // 1) 先扫到设备（CoreBluetooth 必须先持有 CBPeripheral 才能连接）
@@ -510,26 +631,30 @@ class IosBleTransport : BmsTransport {
             readySignal = ready
             val servicesFound = CompletableDeferred<Unit>()
             servicesSignal = servicesFound
-            dropSignal = null
+            // 掉线信号必须在「可能就绪」之前挂好：delegate 在主队列、这里在 Default，
+            // 若等 ready 返回后再赋值，正好落在这个窗口里的掉线会被漏掉（回调落在上一轮的
+            // deferred 上），本轮就永远挂在 dropped.await()——界面停在「已连接」，也不再重连
+            val dropped = CompletableDeferred<Unit>()
+            dropSignal = dropped
             peripheral = target
             logI("连接目标 ${target.name ?: "未命名"} ${target.identifier.UUIDString}")
             central.connectPeripheral(target, null)
-            // 两段超时：① 建链 + 发现服务用连接超时；② 通道探测按候选条数给预算
-            //（每条候选最多 PROBE_TIMEOUT_MS，与 Android/官方同量级）
+            // 两段超时：① 建链 + 发现服务用连接超时；② 通道探测按**最坏候选数**给预算
+            //（每条候选最多 PROBE_TIMEOUT_MS，与 Android/官方同量级；不能按此刻的候选数算，见 PROBE_BUDGET_MS）
             val discovered = withTimeoutOrNull(CONNECT_TIMEOUT_MS) { servicesFound.await() } != null
             val outcome: Boolean? = if (!discovered) null else {
-                val probeBudget = PROBE_TIMEOUT_MS * candidates.size.coerceAtLeast(1) + 2_000L
-                withTimeoutOrNull(probeBudget) { ready.await() }
+                withTimeoutOrNull(PROBE_BUDGET_MS) { ready.await() }
             }
             if (outcome == true) {
                 _connectHint.value = null
                 _linkState.value = LinkState.Connected
                 logI("链路就绪（通道 ${_activeChannel.value?.id ?: "?"}，单次写上限 $maxWriteLen 字节）")
-                val dropped = CompletableDeferred<Unit>()
-                dropSignal = dropped
                 val connectedAt = epochMillisNow()
                 runCatching { dropped.await() }
                 val livedMs = epochMillisNow() - connectedAt
+                // 存活时长是判断「连上就断」的关键：~7s 说明是本端失联轮切拆的，
+                // 秒级以内则更像板子/系统终止的链路（对照上一行的「连接断开：…」看有无 error）
+                logW("链路断开：就绪后存活 ${livedMs}ms（通道 ${_activeChannel.value?.id ?: "?"}）")
                 closePeripheral()
                 _linkState.value = LinkState.Disconnected
                 if (manualStop || !currentCoroutineContext().isActive) break
@@ -562,8 +687,9 @@ class IosBleTransport : BmsTransport {
      */
     private suspend fun findPeripheral(address: String?): CBPeripheral? {
         val c = central
-        if (c.state != CBManagerStatePoweredOn) {
-            _connectHint.value = "蓝牙未打开或未授权"
+        val state = awaitState()
+        if (state != CBManagerStatePoweredOn) {
+            _connectHint.value = stateHint(state)
             return null
         }
         runCatching { c.stopScan() }
@@ -588,6 +714,9 @@ class IosBleTransport : BmsTransport {
     }
 
     private fun closePeripheral() {
+        // 代次先 +1：不管有没有外设可收尾，本轮的所有迟到者（探测协程、订阅兜底）就此作废——
+        // 它们手里的 CBPeripheral 与下一轮是同一个对象，退订通知会打在活链路上
+        attemptGen++
         val p = peripheral ?: return
         peripheral = null
         writeChar = null
@@ -599,6 +728,8 @@ class IosBleTransport : BmsTransport {
         candidateIndex = 0
         _activeChannel.value = null
         p.delegate = null
+        // 注意：cancelPeripheralConnection 是异步的，返回不等于已断开。这里靠调用方的退避
+        // （≥1s）等它落地；若日志里出现「刚就绪就被正常断开」，先怀疑它落在了新链路上
         runCatching { central.cancelPeripheralConnection(p) }
     }
 

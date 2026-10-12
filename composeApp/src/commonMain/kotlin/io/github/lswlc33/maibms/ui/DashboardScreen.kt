@@ -365,7 +365,9 @@ fun ScanDialog(onDismiss: () -> Unit, onConnect: (String) -> Unit) {
                 Text("正在搜索…", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(start = 9.dp))
             }
             Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                if (canScan && scanError == null && !scanning) {
+                // 报错时也要能重试：原先带了 scanError == null，一旦扫描失败按钮就消失，用户只剩
+                // 「关闭」。iOS 上管理器状态没就绪时首次扫描必然报错，那时没有重试入口等于卡死
+                if (canScan && !scanning) {
                     TextButton(onClick = { scope.launch { io.github.lswlc33.maibms.data.Bms.repository.startScan() } }) { Text("重新扫描", color = MaterialTheme.colorScheme.primary) }
                 }
                 Spacer(Modifier.weight(1f))
