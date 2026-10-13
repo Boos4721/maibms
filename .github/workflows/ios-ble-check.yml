@@ -1,6 +1,9 @@
 name: iOS BLE regression checks
 
 on:
+  push:
+    branches:
+      - 'fix/ios-ble-write-mode'
   pull_request:
     paths:
       - 'composeApp/src/iosMain/**'
