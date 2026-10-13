@@ -22,6 +22,10 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import platform.CoreBluetooth.CBAdvertisementDataLocalNameKey
 import platform.CoreBluetooth.CBCentralManager
 import platform.CoreBluetooth.CBCentralManagerDelegateProtocol
@@ -33,6 +37,7 @@ import platform.CoreBluetooth.CBCharacteristicPropertyRead
 import platform.CoreBluetooth.CBCharacteristicPropertyWrite
 import platform.CoreBluetooth.CBCharacteristicPropertyWriteWithoutResponse
 import platform.CoreBluetooth.CBCharacteristicWriteWithoutResponse
+import platform.CoreBluetooth.CBCharacteristicWriteWithResponse
 import platform.CoreBluetooth.CBManagerState
 import platform.CoreBluetooth.CBManagerStatePoweredOff
 import platform.CoreBluetooth.CBManagerStatePoweredOn
@@ -79,7 +84,8 @@ class IosBleTransport : BmsTransport {
          * 服务发现完成的信号在特征发现**之前**就发出了，那一刻候选表还是空的，算出来只有 10s，
          * 而默认通道没应答、只有备用通道能通的板子跑完 3 条要约 26s，于是永远连不上。
          */
-        const val PROBE_BUDGET_MS = PROBE_TIMEOUT_MS * 3 + 2_000L
+        const val WRITE_TIMEOUT_MS = 5_000L
+        const val PROBE_BUDGET_MS = (PROBE_TIMEOUT_MS + WRITE_TIMEOUT_MS) * 3 + 2_000L
 
         /** 等 CoreBluetooth 状态就位的上限：CBCentralManager 的 state 是异步送的 */
         const val STATE_WAIT_MS = 3_000L
@@ -154,7 +160,10 @@ class IosBleTransport : BmsTransport {
     /** 下次连接优先尝试的通道（手动切换或按设备记忆；仅本进程有效） */
     @Volatile private var preferred: BleChannel? = null
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    // CoreBluetooth delegates use the main queue; keep probes on the same dispatcher.
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private val writeMutex = Mutex()
+    private var writeAck: CompletableDeferred<Unit>? = null
 
     /** 用户想要连接的目标（iOS 上是外设标识串）；null = 已主动断开 */
     @Volatile private var desiredAddress: String? = null
@@ -308,10 +317,6 @@ class IosBleTransport : BmsTransport {
             logI("特征列表: " + chars.joinToString {
                 "${shortUuid(it.UUID.UUIDString)}(${it.UUID.UUIDString} ${propText(it.properties)})"
             })
-            maxWriteLen = peripheral
-                .maximumWriteValueLengthForType(CBCharacteristicWriteWithoutResponse)
-                .toInt()
-            logD("单次写上限 $maxWriteLen 字节")
             // 候选通道：先按官方规则判定这块硬件有没有备用通道（暴露**可写**的 FFF5），
             // 再按实际特征与属性过滤（写特征要可写、通知特征要能 notify/indicate）——与 Android 同款规则
             val found: List<Candidate> = if (targetFamily.isMeter) {
@@ -356,26 +361,18 @@ class IosBleTransport : BmsTransport {
             didUpdateNotificationStateForCharacteristic: CBCharacteristic,
             error: NSError?,
         ) {
+            // Unsubscribe callbacks and callbacks for an old candidate must not start a probe.
+            if (peripheral !== this@IosBleTransport.peripheral ||
+                didUpdateNotificationStateForCharacteristic !== notifyChar) return
             if (error != null) {
-                val uuid = didUpdateNotificationStateForCharacteristic.UUID.UUIDString
-                // 上一轮的迟到回调也会走这里：iOS 复用同一个 CBPeripheral，若它在这里翻页，
-                // 本轮的候选指针就被带偏了。认不准期望特征时（expected == null）保持原行为
-                val expected = notifyChar?.UUID?.UUIDString
-                if (expected != null && !uuid.equals(expected, ignoreCase = true)) {
-                    logD("订阅失败回调不属于当前候选（${shortUuid(uuid)}），忽略")
-                    return
-                }
-                // 订阅没落地 = 这条通道收不到任何帧：换下一个候选（没有下一个则本轮连接失败）
                 logE("订阅通知失败：${error.localizedDescription}（换下一个候选通道）")
                 candidateIndex++
                 probeNext(peripheral)
                 return
             }
-            val uuid = didUpdateNotificationStateForCharacteristic.UUID.UUIDString
-            if (uuid.equals(notifyChar?.UUID?.UUIDString, ignoreCase = true)) {
-                logD("订阅已落地，开始发探测帧")
-                candidates.getOrNull(candidateIndex)?.let { afterSubscribed(peripheral, it) }
-            }
+            if (!didUpdateNotificationStateForCharacteristic.isNotifying) return
+            logD("订阅已落地，开始发探测帧")
+            candidates.getOrNull(candidateIndex)?.let { afterSubscribed(peripheral, it) }
         }
 
         @ObjCSignatureOverride
@@ -395,6 +392,19 @@ class IosBleTransport : BmsTransport {
             _incoming.tryEmit(bytes)
         }
 
+        @ObjCSignatureOverride
+        override fun peripheral(
+            peripheral: CBPeripheral,
+            didWriteValueForCharacteristic: CBCharacteristic,
+            error: NSError?,
+        ) {
+            if (peripheral !== this@IosBleTransport.peripheral ||
+                didWriteValueForCharacteristic !== writeChar) return
+            val ack = writeAck ?: return
+            if (error == null) ack.complete(Unit)
+            else ack.completeExceptionally(IllegalStateException(error.localizedDescription))
+        }
+
         /**
          * 试下一个候选通道：订阅通知 → 发探测帧等应答。
          * 全部候选都失败就按本轮连接失败处理，交给重连循环退避重试。
@@ -409,6 +419,8 @@ class IosBleTransport : BmsTransport {
             }
             writeChar = c.write
             notifyChar = c.notify
+            maxWriteLen = p.maximumWriteValueLengthForType(writeType(c.write)).toInt()
+            logD("写入模式 ${writeType(c.write)}，单次写上限 $maxWriteLen 字节")
             probeStarted = false
             logI("通道探测 ${candidateIndex + 1}/${candidates.size}：${c.channel.id}（写 ${shortUuid(c.write.UUID.UUIDString)} / 通知 ${shortUuid(c.notify.UUID.UUIDString)}）")
             _connectHint.value = "通道探测：${c.channel.label}…"
@@ -431,7 +443,7 @@ class IosBleTransport : BmsTransport {
          * 订阅落地后的动作：保护板走 ANT 探测；电量计暂无探测帧，直接按“FFE0 + 写/通知就绪”判就绪。
          */
         private fun afterSubscribed(p: CBPeripheral, c: Candidate) {
-            if (p !== peripheral) return
+            if (p !== peripheral || candidates.getOrNull(candidateIndex) !== c) return
             if (targetFamily.isMeter) {
                 _activeChannel.value = c.channel
                 logI("电量计通道就绪：${c.channel.id}（家族 ${targetFamily.label}，跳过保护板探测）")
@@ -453,19 +465,15 @@ class IosBleTransport : BmsTransport {
             probeSignal = signal
             scope.launch {
                 delay(PROBE_SETTLE_MS)   // 等订阅生效，与官方 200ms 切通道间隔一致
-                if (gen != attemptGen) return@launch   // 本轮已被收尾，别碰新链路
+                if (gen != attemptGen || candidates.getOrNull(candidateIndex) !== c) return@launch
                 runCatching {
-                    p.writeValue(
-                        Frame.readRealtime().toNSData(),
-                        forCharacteristic = c.write,
-                        type = CBCharacteristicWriteWithoutResponse,
-                    )
+                    writeFrame(p, c.write, Frame.readRealtime(), gen)
                 }.onFailure { logW("探测帧写入失败：${it.message}") }
                 val ok = withTimeoutOrNull(PROBE_TIMEOUT_MS) { signal.await() } ?: false
                 // 这 8 秒里链路可能已经换代（掉线重连/被放弃）：iOS 的 p 与当前 peripheral 是**同一个
                 // 对象**，下面的退订和翻页会打在活链路上（退订通知 = 应用从此收不到任何帧），
                 // 所以这里必须按代次认人——这是 Android 那句 `g !== gatt` 在 iOS 的等价物
-                if (gen != attemptGen) {
+                if (gen != attemptGen || candidates.getOrNull(candidateIndex) !== c) {
                     logD("探测协程已过期（第 $gen 轮），丢弃结果：${c.channel.id}")
                     return@launch
                 }
@@ -717,6 +725,8 @@ class IosBleTransport : BmsTransport {
         // 代次先 +1：不管有没有外设可收尾，本轮的所有迟到者（探测协程、订阅兜底）就此作废——
         // 它们手里的 CBPeripheral 与下一轮是同一个对象，退订通知会打在活链路上
         attemptGen++
+        writeAck?.completeExceptionally(IllegalStateException("连接已关闭"))
+        writeAck = null
         val p = peripheral ?: return
         peripheral = null
         writeChar = null
@@ -741,20 +751,53 @@ class IosBleTransport : BmsTransport {
         if (_linkState.value != LinkState.Connected) { logW("写入被丢弃：链路未就绪"); return }
         // 帧日志统一走协议层的遮蔽版：0x23 密码帧的数据区不能被原样写进日志
         logD("→ ${Frame.hexForLog(frame)}")
-        val chunk = minOf(maxWriteLen, MAX_CHUNK).coerceAtLeast(20)
-        var offset = 0
-        while (offset < frame.size) {
-            val len = minOf(chunk, frame.size - offset)
-            val piece = frame.copyOfRange(offset, offset + len)
-            p.writeValue(
-                piece.toNSData(),
-                forCharacteristic = wc,
-                type = CBCharacteristicWriteWithoutResponse,
-            )
-            offset += len
-            delay(WRITE_GAP_MS)
-        }
+        writeFrame(p, wc, frame, attemptGen)
     }
+
+    /** Prefer no-response only when advertised, exactly as in ANT BMS. */
+    private fun writeType(c: CBCharacteristic) =
+        if (bleWriteMode(
+                (c.properties and CBCharacteristicPropertyWriteWithoutResponse).toInt() != 0,
+                (c.properties and CBCharacteristicPropertyWrite).toInt() != 0,
+            ) == BleWriteMode.WithoutResponse) CBCharacteristicWriteWithoutResponse
+        else CBCharacteristicWriteWithResponse
+
+    /** Serialize complete frames; never interleave chunks from probe/poll/config writes. */
+    private suspend fun writeFrame(p: CBPeripheral, wc: CBCharacteristic, frame: ByteArray, gen: Int) =
+        withContext(Dispatchers.Main) {
+            writeMutex.withLock {
+                val type = writeType(wc)
+                val chunk = minOf(p.maximumWriteValueLengthForType(type).toInt(), MAX_CHUNK)
+                check(chunk > 0) { "设备写入上限无效" }
+                var offset = 0
+                while (offset < frame.size) {
+                    check(gen == attemptGen && p === peripheral && wc === writeChar) { "连接或通道已变化" }
+                    val len = minOf(chunk, frame.size - offset)
+                    if (type == CBCharacteristicWriteWithResponse) {
+                        val ack = CompletableDeferred<Unit>()
+                        writeAck = ack
+                        try {
+                            p.writeValue(frame.copyOfRange(offset, offset + len).toNSData(), wc, type)
+                            withTimeout(WRITE_TIMEOUT_MS) { ack.await() }
+                        } finally {
+                            if (writeAck === ack) writeAck = null
+                        }
+                    } else {
+                        // Respect CoreBluetooth backpressure instead of silently losing chunks.
+                        withTimeout(WRITE_TIMEOUT_MS) {
+                            while (!p.canSendWriteWithoutResponse) {
+                                check(gen == attemptGen && p === peripheral) { "连接已变化" }
+                                delay(WRITE_GAP_MS)
+                            }
+                        }
+                        check(gen == attemptGen && p === peripheral && wc === writeChar) { "连接或通道已变化" }
+                        p.writeValue(frame.copyOfRange(offset, offset + len).toNSData(), wc, type)
+                    }
+                    offset += len
+                    delay(WRITE_GAP_MS)
+                }
+            }
+        }
 
     /** 主动断开：清掉目标地址，重连循环自然退出 */
     override suspend fun disconnect() {
